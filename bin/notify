@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Resolve the project root from this script's location, then read the topic.
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+project_dir="$(dirname "$script_dir")"
+cfg="${NTFY_TOPIC_FILE:-$project_dir/.ntfy-topic}"
+
+topic="${NTFY_TOPIC:-}"
+if [[ -z "$topic" && -r "$cfg" ]]; then
+  topic="$(tr -d '[:space:]' < "$cfg")"
+fi
+if [[ -z "$topic" ]]; then
+  echo "notify: set NTFY_TOPIC or put the topic in $cfg" >&2
+  exit 1
+fi
+
+# Server: NTFY_SERVER, else .ntfy-server, else the public ntfy.sh.
+server="${NTFY_SERVER:-}"
+if [[ -z "$server" && -r "$project_dir/.ntfy-server" ]]; then
+  server="$(tr -d '[:space:]' < "$project_dir/.ntfy-server")"
+fi
+server="${server:-https://ntfy.sh}"
+server="${server%/}"
+
+# Access token: NTFY_TOKEN, else .ntfy-token.
+token="${NTFY_TOKEN:-}"
+if [[ -z "$token" && -r "$project_dir/.ntfy-token" ]]; then
+  token="$(tr -d '[:space:]' < "$project_dir/.ntfy-token")"
+fi
+
+# Username/password fallback: NTFY_USER + NTFY_PASSWORD, else .ntfy-credentials
+# (first line username, second line password).
+user="${NTFY_USER:-}"
+password="${NTFY_PASSWORD:-}"
+credentials="$project_dir/.ntfy-credentials"
+if [[ ( -z "$user" || -z "$password" ) && -r "$credentials" ]]; then
+  user="${user:-$(sed -n '1p' "$credentials" | tr -d '\r\n')}"
+  password="${password:-$(sed -n '2p' "$credentials" | tr -d '\r\n')}"
+fi
+
+usage() {
+  echo "usage: notify [-t TITLE] [-p PRIORITY] [-d DELAY | --at WHEN] [--tags a,b] [--no-desktop] MESSAGE" >&2
+  echo "env: NTFY_TOPIC, NTFY_TOPIC_FILE, NTFY_SERVER, NTFY_TOKEN, NTFY_USER, NTFY_PASSWORD" >&2
+}
+
+title=""
+priority="default"
+delay=""
+at=""
+tags=""
+desktop=1
+
+while (($#)); do
+  case "$1" in
+    -t|--title)    title="${2:?}";    shift 2 ;;
+    -p|--priority) priority="${2:?}"; shift 2 ;;
+    -d|--delay)    delay="${2:?}";    shift 2 ;;
+    --at)          at="${2:?}";       shift 2 ;;
+    --tags)        tags="${2:?}";     shift 2 ;;
+    --no-desktop)  desktop=0;         shift ;;
+    --)            shift; break ;;
+    -h|--help)     usage; exit 0 ;;
+    -*)            echo "notify: unknown option $1" >&2; usage; exit 2 ;;
+    *)             break ;;
+  esac
+done
+
+body="$*"
+if [[ -z "$body" ]]; then
+  usage
+  exit 2
+fi
+# Allow callers to write "\n" for a line break.
+body="${body//\\n/$'\n'}"
+
+# --at accepts anything GNU date understands: "today 18:00", "tomorrow 09:00", ...
+if [[ -n "$at" ]]; then
+  delay="$(date -d "$at" --iso-8601=seconds)"
+fi
+
+curl_args=(--fail --silent --show-error --data-raw "$body")
+if [[ -n "$token" ]]; then
+  curl_args+=(-H "Authorization: Bearer $token")
+elif [[ -n "$user" ]]; then
+  curl_args+=(--user "$user:$password")
+fi
+if [[ -n "$title" ]]; then
+  curl_args+=(-H "Title: $title")
+fi
+if [[ -n "$tags" ]]; then
+  curl_args+=(-H "Tags: $tags")
+fi
+if [[ -n "$delay" ]]; then
+  curl_args+=(-H "X-Delay: $delay")
+fi
+curl_args+=(-H "Priority: $priority")
+
+curl "${curl_args[@]}" "$server/$topic" >/dev/null
+
+# Desktop popup only for immediate messages (scheduled ones should not fire now).
+if (( desktop )) && [[ -z "$delay" ]] && [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]] \
+   && command -v notify-send >/dev/null 2>&1; then
+  notify-send -a OpenCode "${title:-Notification}" "$body" || true
+fi
+
+printf 'ok\n'
